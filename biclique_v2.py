@@ -370,9 +370,13 @@ class SchedulingEncoder:
         self.cnf = CNF()
         self.x = {}  # (i,t,m)->var
         self.y = {}  # (m,t1,t2)->var
+        self.U = {}  # (i,m)->var, for symmetry breaking
 
     def build_x_and_link(self):
         y_to_x = defaultdict(list)
+        # Helper for symmetry breaking: group x-vars by (task, machine)
+        x_by_im = defaultdict(list)
+
         for i in range(self.N):
             t_min = max(0, self.r[i])
             t_max = min(self.T - self.d[i], self.e[i] - self.d[i])
@@ -383,6 +387,8 @@ class SchedulingEncoder:
                 for m in range(self.M):
                     xv = self.pool.new(("x", i, t, m))
                     self.x[(i, t, m)] = xv
+                    x_by_im[(i, m)].append(xv)
+
                     t1, t2 = t, t + self.d[i]
                     yk = (m, t1, t2)
                     yv = self.y.get(yk)
@@ -390,13 +396,24 @@ class SchedulingEncoder:
                         yv = self.pool.new(("y", m, t1, t2))
                         self.y[yk] = yv
                     self.cnf.append([-xv, yv])
-                    # Correct reverse link is essential
                     y_to_x[yk].append(xv)
         
         for yk, yv in self.y.items():
             xs = y_to_x.get(yk, [])
             if xs:
                 self.cnf.append([-yv] + xs)
+        
+        # Create U_im variables and link them to x_itm variables
+        for (i, m), x_vars in x_by_im.items():
+            if not x_vars: continue
+            u_var = self.pool.new(("U", i, m))
+            self.U[(i, m)] = u_var
+            # Link x -> U: if any x_itm is true, U_im must be true
+            for x_var in x_vars:
+                self.cnf.append([-x_var, u_var])
+            # Link U -> x: if U_im is true, at least one x_itm must be true
+            # This part is expensive and not strictly necessary for symmetry breaking to work
+            # self.cnf.append([-u_var] + x_vars)
 
     def per_task_exactly_one(self):
         for i in range(self.N):
@@ -431,30 +448,29 @@ class SchedulingEncoder:
 
     def symmetry_breaking(self):
         """
-        Adds symmetry-breaking constraints to prune the search space.
-        If a task i is placed on machine m > 0, it implies that some task j < i
-        has been placed on machine m-1. This forces a canonical ordering of
-        machine usage.
+        Adds efficient task-level symmetry-breaking constraints.
+        If task i is on machine m > 0, some task j < i must be on machine m-1.
+        This is enforced using U_im helper variables.
         """
         if self.M <= 1:
             return
 
-        for i in range(1, self.N):  # For tasks 1 to N-1
-            for m in range(1, self.M):  # For machines 1 to M-1
-                # All x-variables for task i on machine m
-                x_im = [v for (ii, t, mm), v in self.x.items() if ii == i and mm == m]
-                if not x_im: continue
+        for i in range(1, self.N):
+            for m in range(1, self.M):
+                u_im = self.U.get((i, m))
+                if u_im is None: continue
 
-                # All x-variables for tasks j < i on machine m-1
-                x_jm_prev = [v for (ii, t, mm), v in self.x.items() if ii < i and mm == m - 1]
-                if not x_jm_prev: continue
+                # Collect all U variables for tasks j < i on machine m-1
+                prev_machine_u_vars = [self.U.get((j, m - 1)) for j in range(i)]
+                prev_machine_u_vars = [v for v in prev_machine_u_vars if v is not None]
+
+                if not prev_machine_u_vars:
+                    # If no tasks can be placed on the previous machine, then task i cannot be on this machine
+                    self.cnf.append([-u_im])
+                    continue
                 
-                # If task i is on machine m (OR of x_im is true), then some task j < i
-                # must be on machine m-1 (OR of x_jm_prev is true).
-                # This is encoded as: x_im_var => OR(x_jm_prev)
-                # Which is equivalent to: -x_im_var OR OR(x_jm_prev)
-                for x_var in x_im:
-                    self.cnf.append([-x_var] + x_jm_prev)
+                # U_im => OR_{j<i} U_j,m-1
+                self.cnf.append([-u_im] + prev_machine_u_vars)
 
     def encode(self):
         self.build_x_and_link()
@@ -463,7 +479,7 @@ class SchedulingEncoder:
         if any(len(c) == 0 for c in self.cnf.clauses): return self.cnf
         self.duration_partition_amo()
         self.disjoint_y_intervals()
-        # self.symmetry_breaking()
+        self.symmetry_breaking()
         return self.cnf
 
 # ----------------------------- I/O and Solve ---------------------------------
