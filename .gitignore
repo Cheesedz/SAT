@@ -1,3 +1,6 @@
-input
-out
-run.log
+
+*.log
+.DS_Store
+__pycache__
+*.
+*.md
